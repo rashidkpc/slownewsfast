@@ -1,6 +1,6 @@
 # slownewsfast
 
-Convert email newsletters into Atom feeds. A Cloudflare-native replacement for kill-the-newsletter. It's 2026 **of course** it was vibe slopped out of nothing. Y'all acting like ya writing code anymore.
+Convert email newsletters into Atom feeds. A Cloudflare-native replacement for kill-the-newsletter. It's 2026 **of course** it was vibe slopped out of nothing. Y'all acting like ya writing code anymore. Excuse the README tone, I've got the 2006 message-of-hope film "Idiocracy" on in the background.
 
 ## Architecture
 
