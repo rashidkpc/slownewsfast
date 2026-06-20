@@ -22,6 +22,8 @@ Convert email newsletters into Atom feeds. A Cloudflare-native replacement for k
 
 ## Deployment
 
+The instructions below probably work. Or just launch whatever agent CLI thing you have, and make it do the deploy. Nailed it. 
+
 ### 1. Clone and install
 
 ```bash
