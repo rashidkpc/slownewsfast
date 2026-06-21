@@ -1,8 +1,8 @@
 import { Hono } from "hono";
 import PostalMime from "postal-mime";
 
-const CONTENT_LIMIT = 2 ** 19;
 const RATE_LIMIT = 10;
+const MAX_ENTRIES = 50;
 const PUBLIC_ID_LENGTH = 20;
 const PUBLIC_ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -81,56 +81,128 @@ function generateFeedXml(
   return xml;
 }
 
-function generateEntryHtml(entry: Record<string, unknown>, hostname: string): string {
+async function sanitizeContent(html: string): Promise<string> {
+  const stripped = html
+    .replace(/background(-color)?\s*:\s*[^;"]+/gi, "")
+    .replace(/(min-)?width\s*:\s*[^;"]+/gi, "");
+  return new HTMLRewriter()
+    .on("script, style", {
+      element(e) {
+        e.remove();
+      },
+    })
+    .on("*", {
+      element(e) {
+        e.removeAttribute("width");
+        for (const [name] of e.attributes) {
+          if (/^on\w+/.test(name)) e.removeAttribute(name);
+        }
+      },
+    })
+    .transform(new Response(stripped))
+    .text();
+}
+
+async function generateEntryHtml(entry: Record<string, unknown>, hostname: string): Promise<string> {
+  const content = await sanitizeContent(getStr(entry, "content"));
+  const feedTitle = escapeXml(getStr(entry, "feed_title"));
+  const feedPublicId = escapeXml(getStr(entry, "feed_public_id"));
+  const title = escapeXml(getStr(entry, "title"));
+  const author = escapeXml(getStr(entry, "author") || "Unknown");
+  const date = escapeXml(getStr(entry, "created_at"));
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeXml(getStr(entry, "title"))} — ${escapeXml(getStr(entry, "feed_title"))}</title>
+  <title>${title} — ${feedTitle}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: Georgia, "Times New Roman", serif;
+      color: #1c1917;
+      background: #fafaf9;
+      margin: 0;
+      padding: 0;
+    }
+    .container {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 2rem 0;
+      overflow-wrap: break-word;
+      word-break: break-word;
+      overflow-x: hidden;
+    }
+    .container * {
+      max-width: 100% !important;
+      min-width: 0 !important;
+      box-sizing: border-box;
+    }
+    .container table {
+      width: auto !important;
+    }
+    .container img,
+    .container video {
+      height: auto !important;
+    }
+    header {
+      border-bottom: 2px solid #d6d3d1;
+      padding: 0 1.5rem 1.5rem;
+      margin-bottom: 2rem;
+    }
+    footer {
+      border-top: 2px solid #d6d3d1;
+      padding: 1.5rem 1.5rem 0;
+      margin-top: 2rem;
+    }
+    @media (max-width: 480px) {
+      header {
+        padding: 0 0.75rem 1.5rem;
+      }
+      footer {
+        padding: 1.5rem 0.75rem 0;
+      }
+    }
+      margin-top: 2rem;
+      font-size: 0.875rem;
+      color: #78716c;
+    }
+    footer a {
+      color: #57534e;
+      text-underline-offset: 2px;
+    }
+    footer a:hover { color: #1c1917; }
+    footer span { margin: 0 0.5rem; color: #d6d3d1; }
+  </style>
 </head>
 <body>
-  <article>
-    <h1>${escapeXml(getStr(entry, "title"))}</h1>
-    <p><small>By ${escapeXml(getStr(entry, "author") || "Unknown")} on ${escapeXml(getStr(entry, "created_at"))}</small></p>
-    <hr>
-    ${entry["content"] || ""}
-    <hr>
-    <p><small>
-      <a href="https://${hostname}/feeds/${escapeXml(getStr(entry, "feed_public_id"))}.xml">Atom feed</a>
-      —
-      <a href="https://${hostname}/feeds/${escapeXml(getStr(entry, "feed_public_id"))}">Feed settings</a>
-    </small></p>
-  </article>
+  <div class="container">
+    <header>
+      <p class="feed-name">${feedTitle}</p>
+      <h1>${title}</h1>
+      <p class="byline">By <strong>${author}</strong> on ${date}</p>
+    </header>
+    ${content}
+    <footer>
+      <a href="https://${hostname}/feeds/${feedPublicId}.xml">Atom feed</a>
+      <span>·</span>
+      <a href="https://${hostname}/feeds/${feedPublicId}">Feed settings</a>
+    </footer>
+  </div>
 </body>
 </html>`;
 }
 
 async function trimFeedEntries(db: D1Database, feedId: number): Promise<void> {
-  const entries = await db
-    .prepare("SELECT id, title, content FROM feed_entries WHERE feed_id = ? ORDER BY id DESC")
-    .bind(feedId)
-    .all();
-
-  let totalSize = 0;
-  const toDelete: number[] = [];
-
-  for (const entry of entries.results) {
-    const r = entry as Record<string, unknown>;
-    const size = (getStr(r, "title").length || 0) + (getStr(r, "content").length || 0);
-    totalSize += size;
-    if (totalSize > CONTENT_LIMIT) {
-      toDelete.push(getNum(r, "id"));
-    }
-  }
-
-  if (toDelete.length > 0) {
-    const placeholders = toDelete.map(() => "?").join(",");
-    await db
-      .prepare(`DELETE FROM feed_entries WHERE id IN (${placeholders})`)
-      .bind(...toDelete)
-      .run();
-  }
+  await db
+    .prepare(
+      `DELETE FROM feed_entries WHERE feed_id = ? AND id NOT IN (
+         SELECT id FROM feed_entries WHERE feed_id = ? ORDER BY id DESC LIMIT ?
+       )`,
+    )
+    .bind(feedId, feedId, MAX_ENTRIES)
+    .run();
 }
 
 const SESSION_DURATION = 30 * 24 * 60 * 60 * 1000;
@@ -263,6 +335,56 @@ app.post("/api/feeds", requireAuth, async (c) => {
   );
 });
 
+app.get("/api/feeds", requireAuth, async (c) => {
+  const feeds = await c.env.DB.prepare(
+    "SELECT public_id, title, icon, email_icon, created_at FROM feeds ORDER BY created_at DESC",
+  ).all();
+
+  const hostname = c.env.DOMAIN;
+  const result = feeds.results.map((feed) => {
+    const f = feed as Record<string, unknown>;
+    return {
+      publicId: f["public_id"],
+      title: f["title"],
+      icon: f["icon"],
+      emailIcon: f["email_icon"],
+      email: `${f["public_id"]}@${hostname}`,
+      feedUrl: `https://${hostname}/feeds/${f["public_id"]}.xml`,
+      createdAt: f["created_at"],
+    };
+  });
+
+  return c.json(result);
+});
+
+app.get("/api/entries", requireAuth, async (c) => {
+  const entries = await c.env.DB.prepare(
+    `SELECT fe.public_id, fe.title, fe.author, fe.created_at, fe.read,
+            f.public_id as feed_public_id, f.title as feed_title,
+            f.icon, f.email_icon
+     FROM feed_entries fe
+     INNER JOIN feeds f ON fe.feed_id = f.id
+     ORDER BY fe.id DESC`,
+  ).all();
+
+  const result = entries.results.map((e) => {
+    const r = e as Record<string, unknown>;
+    return {
+      publicId: r["public_id"],
+      title: r["title"],
+      author: r["author"],
+      createdAt: r["created_at"],
+      read: getNum(r, "read") === 1,
+      feedPublicId: r["feed_public_id"],
+      feedTitle: r["feed_title"],
+      icon: r["icon"],
+      emailIcon: r["email_icon"],
+    };
+  });
+
+  return c.json(result);
+});
+
 app.get("/api/feeds/:publicId", requireAuth, async (c) => {
   const publicId = c.req.param("publicId");
   const feed = await c.env.DB.prepare("SELECT * FROM feeds WHERE public_id = ?")
@@ -282,6 +404,44 @@ app.get("/api/feeds/:publicId", requireAuth, async (c) => {
     feedUrl: `https://${hostname}/feeds/${f["public_id"]}.xml`,
     createdAt: f["created_at"],
   });
+});
+
+app.get("/api/feeds/:publicId/entries", requireAuth, async (c) => {
+  const publicId = c.req.param("publicId");
+  const feed = await c.env.DB.prepare("SELECT id FROM feeds WHERE public_id = ?")
+    .bind(publicId)
+    .first();
+
+  if (!feed) return c.json({ error: "Feed not found" }, 404);
+
+  const feedId = getNum(feed as Record<string, unknown>, "id");
+  const entries = await c.env.DB.prepare(
+    "SELECT public_id, title, author, created_at, read FROM feed_entries WHERE feed_id = ? ORDER BY id DESC",
+  ).bind(feedId).all();
+
+  const result = entries.results.map((e) => {
+    const r = e as Record<string, unknown>;
+    return {
+      publicId: r["public_id"],
+      title: r["title"],
+      author: r["author"],
+      createdAt: r["created_at"],
+      read: getNum(r, "read") === 1,
+    };
+  });
+
+  return c.json(result);
+});
+
+app.patch("/api/entries/:publicId/read", requireAuth, async (c) => {
+  const publicId = c.req.param("publicId");
+  const body = await c.req.json();
+
+  await c.env.DB.prepare(
+    "UPDATE feed_entries SET read = ? WHERE public_id = ?",
+  ).bind(body.read ? 1 : 0, publicId).run();
+
+  return c.json({ success: true });
 });
 
 app.patch("/api/feeds/:publicId", requireAuth, async (c) => {
@@ -463,7 +623,7 @@ app.get("/feeds/:publicId/entries/:entryId", async (c) => {
   if (!entry) return c.notFound();
 
   const hostname = c.env.DOMAIN;
-  const html = generateEntryHtml(entry as Record<string, unknown>, hostname);
+  const html = await generateEntryHtml(entry as Record<string, unknown>, hostname);
 
   return new Response(html, {
     headers: {
@@ -598,8 +758,6 @@ export default {
             "UPDATE feeds SET email_icon = ? WHERE id = ?",
           ).bind(emailIcon, feedId).run();
         }
-
-        await trimFeedEntries(env.DB, feedId);
       })(),
     );
   },
