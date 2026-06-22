@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
-import { Pencil, Plus } from "lucide-react";
+import { Download, Pencil, Plus } from "lucide-react";
 import FeedIcon from "../components/FeedIcon";
 
 interface FeedItem {
@@ -25,6 +25,35 @@ export default function Feeds() {
       .catch(() => {})
       .finally(() => setLoading(false));
   }, []);
+
+  function exportOpml() {
+    const items = feeds
+      .map(
+        (f) =>
+          `      <outline text="${f.title.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}" type="rss" xmlUrl="${f.feedUrl.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}"/>`,
+      )
+      .join("\n");
+
+    const xml = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<opml version="2.0">',
+      "  <head>",
+      "    <title>slownewsfast Feeds</title>",
+      "  </head>",
+      "  <body>",
+      items,
+      "  </body>",
+      "</opml>",
+    ].join("\n");
+
+    const blob = new Blob([xml], { type: "text/xml" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "slownewsfast.opml";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
 
   const filtered = feeds.filter(
     (f) =>
@@ -53,6 +82,13 @@ export default function Feeds() {
         >
           <Plus size={18} />
         </Link>
+        <button
+          onClick={exportOpml}
+          className="flex items-center justify-center border-2 border-stone-300 bg-white px-3 text-stone-500 hover:text-stone-800 hover:border-stone-500 transition-colors cursor-pointer"
+          title="Export OPML"
+        >
+          <Download size={18} />
+        </button>
       </div>
 
       {filtered.length === 0 ? (
