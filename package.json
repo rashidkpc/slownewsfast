@@ -6,10 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "deploy": "wrangler deploy",
+    "deploy": "vite build && wrangler deploy",
     "types": "wrangler types"
   },
   "dependencies": {
+    "croner": "^10.0.1",
+    "fast-xml-parser": "^5.2.2",
     "hono": "^4.7.8",
     "lucide-react": "^1.21.0",
     "postal-mime": "^2.4.4",

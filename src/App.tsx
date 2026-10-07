@@ -1,11 +1,11 @@
 import { useState, useEffect } from "react";
-import { Routes, Route, useNavigate, Link } from "react-router-dom";
-import { Settings, Home as HomeIcon } from "lucide-react";
+import { Routes, Route, useNavigate, Navigate, Link } from "react-router-dom";
+import { Home as HomeIcon } from "lucide-react";
 import Home from "./pages/Home";
 import FeedSettings from "./pages/FeedSettings";
 import Feeds from "./pages/Feeds";
-import Items from "./pages/Items";
 import FeedEntries from "./pages/FeedEntries";
+import SourceEntries from "./pages/SourceEntries";
 
 function LoginForm({ onLogin }: { onLogin: () => void }) {
   const [password, setPassword] = useState("");
@@ -41,7 +41,7 @@ function LoginForm({ onLogin }: { onLogin: () => void }) {
         onSubmit={handleSubmit}
         className="w-full max-w-sm rounded-lg border-2 border-stone-300 bg-white p-8 space-y-4"
       >
-        <h1 className="text-xl font-bold text-stone-900">slownewsfast</h1>
+        <h1 className="text-xl font-bold text-stone-900">slownews</h1>
         <p className="text-sm text-stone-500">Enter the password to continue.</p>
         <div>
           <input
@@ -57,7 +57,7 @@ function LoginForm({ onLogin }: { onLogin: () => void }) {
         <button
           type="submit"
           disabled={loading || !password}
-          className="w-full border-2 border-stone-800 bg-stone-800 px-6 py-2.5 text-sm font-bold text-white hover:bg-stone-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          className="w-full border-2 border-stone-800 bg-stone-800 px-6 py-2.5 text-sm font-bold text-white hover:bg-stone-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors cursor-pointer"
         >
           {loading ? "Checking..." : "Sign in"}
         </button>
@@ -83,6 +83,11 @@ export default function App() {
     navigate("/");
   };
 
+  const handleLogin = () => {
+    setAuthed(true);
+    navigate("/feeds", { replace: true });
+  };
+
   if (authed === null) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-stone-50">
@@ -94,7 +99,7 @@ export default function App() {
   if (!authed) {
     return (
       <div className="min-h-screen bg-stone-50 text-stone-800">
-        <LoginForm onLogin={() => setAuthed(true)} />
+        <LoginForm onLogin={handleLogin} />
       </div>
     );
   }
@@ -103,27 +108,20 @@ export default function App() {
     <div className="min-h-screen bg-stone-50 text-stone-800">
       <header className="border-b-2 border-stone-300 bg-white px-6 py-4">
         <div className="mx-auto flex max-w-5xl items-center justify-between">
-          <Link to="/" className="text-xl font-bold tracking-tight text-stone-900">
-            slownewsfast
+          <Link to="/feeds" className="text-xl font-bold tracking-tight text-stone-900">
+            slownews
           </Link>
           <div className="flex items-center gap-3">
             <Link
-              to="/"
+              to="/feeds"
               className="text-stone-500 hover:text-stone-800 transition-colors"
-              title="Home"
+              title="Feeds"
             >
               <HomeIcon size={18} />
             </Link>
-            <Link
-              to="/feeds"
-              className="text-stone-500 hover:text-stone-800 transition-colors"
-              title="Feed settings"
-            >
-              <Settings size={18} />
-            </Link>
             <button
               onClick={handleLogout}
-              className="text-sm text-stone-500 hover:text-stone-800 transition-colors"
+              className="text-sm text-stone-500 hover:text-stone-800 transition-colors cursor-pointer"
             >
               Log out
             </button>
@@ -132,11 +130,12 @@ export default function App() {
       </header>
       <main className="mx-auto max-w-3xl px-6 py-12">
         <Routes>
-          <Route path="/" element={<Items />} />
+          <Route path="/" element={<Navigate to="/feeds" replace />} />
           <Route path="/new" element={<Home />} />
           <Route path="/feeds" element={<Feeds />} />
           <Route path="/feeds/:publicId" element={<FeedSettings />} />
           <Route path="/feeds/:publicId/entries" element={<FeedEntries />} />
+          <Route path="/feeds/:publicId/sources" element={<SourceEntries />} />
         </Routes>
       </main>
     </div>
