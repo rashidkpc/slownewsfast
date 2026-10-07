@@ -186,7 +186,6 @@ app.get("/api/presets", async (c) => {
 app.post("/api/feeds", requireAuth, async (c) => {
   const body = await c.req.json();
   const kind = body.kind === "digest" ? "feed_digest" : "email";
-  const hostname = c.env.DOMAIN;
 
   if (kind === "email") {
     const title = String(body.title || "").trim();
@@ -204,7 +203,7 @@ app.post("/api/feeds", requireAuth, async (c) => {
     const feed = await c.env.DB.prepare("SELECT * FROM feeds WHERE id = ?").bind(feedId).first();
     const producer = await loadProducer(c.env.DB, feedId);
     return c.json(
-      feedToJson(feed as Record<string, unknown>, producer, hostname),
+      feedToJson(feed as Record<string, unknown>, producer, c.env.DOMAIN),
       201,
     );
   }
@@ -268,7 +267,7 @@ app.post("/api/feeds", requireAuth, async (c) => {
   await updateProducer(c.env.DB, getNum(producer, "id"), { state, nextRunAt: next });
   producer = (await loadProducer(c.env.DB, feedId))!;
 
-  return c.json(feedToJson(feed, producer, hostname), 201);
+  return c.json(feedToJson(feed, producer, c.env.DOMAIN), 201);
 });
 
 app.get("/api/feeds", requireAuth, async (c) => {
@@ -281,7 +280,6 @@ app.get("/api/feeds", requireAuth, async (c) => {
       ORDER BY f.created_at DESC`,
   ).all();
 
-  const hostname = c.env.DOMAIN;
   return c.json(
     (rows.results as Record<string, unknown>[]).map((r) => {
       const producer: ProducerRow = {
@@ -290,7 +288,7 @@ app.get("/api/feeds", requireAuth, async (c) => {
         state: r["producer_state"],
         error: r["producer_error"],
       };
-      return feedToJson(r, producer, hostname, { entryCount: getNum(r, "entry_count") });
+      return feedToJson(r, producer, c.env.DOMAIN, { entryCount: getNum(r, "entry_count") });
     }),
   );
 });
