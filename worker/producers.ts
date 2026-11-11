@@ -94,6 +94,13 @@ export function feedDisplayTitle(feed: Record<string, unknown>): string {
   return getStr(feed, "title") || getStr(feed, "source_title") || getStr(feed, "public_id") || "Untitled";
 }
 
+// Keep IN (...) lookups under D1's bound-parameter limit.
+function chunks<T>(items: T[], size = 50): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Digest producer: poll the source into the inbox
 // ---------------------------------------------------------------------------
@@ -169,46 +176,64 @@ async function pollDigestProducer(env: Env, feed: ProducerRow, producer: Produce
     )
     .run();
 
-  // Guids already folded into a published entry must never be re-ingested.
-  const consumed = await db
-    .prepare(
-      `SELECT esi.guid AS guid FROM entry_source_items esi
-       INNER JOIN feed_entries e ON e.id = esi.entry_id
-       WHERE e.feed_id = ?`,
-    )
-    .bind(feedId)
+  // Guids we already hold must never be re-ingested: either they were folded
+  // into a published entry, or they are still waiting in the inbox. Only look
+  // up the guids this poll actually saw, instead of reading the feed's entire
+  // dedup history, and skip pending rows so repeat polls do no work.
+  const pending = await db
+    .prepare("SELECT guid FROM source_items WHERE producer_id = ?")
+    .bind(producerId)
     .all();
-  const consumedGuids = new Set(
-    (consumed.results as Record<string, unknown>[]).map((r) => getStr(r, "guid")),
+  const knownGuids = new Set(
+    (pending.results as Record<string, unknown>[]).map((r) => getStr(r, "guid")),
   );
 
+  const incoming = data.entries.map((entry) => entry.guid).filter(Boolean);
+  for (const batch of chunks(incoming)) {
+    const placeholders = batch.map(() => "?").join(",");
+    const consumed = await db
+      .prepare(
+        `SELECT guid FROM entry_source_items
+          WHERE guid IN (${placeholders})
+            AND entry_id IN (SELECT id FROM feed_entries WHERE feed_id = ?)`,
+      )
+      .bind(...batch, feedId)
+      .all();
+    for (const row of consumed.results as Record<string, unknown>[]) {
+      knownGuids.add(getStr(row, "guid"));
+    }
+  }
+
+  const inserts: D1PreparedStatement[] = [];
   for (const entry of data.entries) {
     if (!entry.guid) continue;
     if (config.eligibleFrom && entry.published < config.eligibleFrom) continue;
-    if (consumedGuids.has(entry.guid)) continue;
+    if (knownGuids.has(entry.guid)) continue;
     const sanitized = entry.content
       ? await sanitizeContent(entry.content, data.link || sourceUrl)
       : "";
-    await db
-      .prepare(
-        `INSERT OR IGNORE INTO source_items
-           (producer_id, guid, url, title, author, image, content, summary, published, discovered_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(
-        producerId,
-        entry.guid,
-        entry.url,
-        entry.title,
-        entry.author,
-        entry.image,
-        sanitized,
-        entry.summary,
-        entry.published,
-        now,
-      )
-      .run();
+    inserts.push(
+      db
+        .prepare(
+          `INSERT OR IGNORE INTO source_items
+             (producer_id, guid, url, title, author, image, content, summary, published, discovered_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          producerId,
+          entry.guid,
+          entry.url,
+          entry.title,
+          entry.author,
+          entry.image,
+          sanitized,
+          entry.summary,
+          entry.published,
+          now,
+        ),
+    );
   }
+  if (inserts.length > 0) await db.batch(inserts);
 
   await updateProducer(db, producerId, { state, error: null });
 }
@@ -244,20 +269,52 @@ function filenameFor(url: string, type: string): string {
   return base;
 }
 
+// Look up every image the digest might ingest in one indexed query, instead of
+// paying a round trip per item. Keys that are absent are still remembered so
+// ingestImage goes straight to fetching them.
+async function preloadImages(
+  env: Env,
+  urls: string[],
+  cache: Map<string, Ingested | null>,
+  known: Set<string>,
+): Promise<void> {
+  const keys = [...new Set(urls.map((url) => url.split("?")[0]).filter(Boolean))];
+  for (const batch of chunks(keys)) {
+    const placeholders = batch.map(() => "?").join(",");
+    const rows = await env.DB.prepare(
+      `SELECT source_url, id, public_id, name FROM feed_enclosures
+        WHERE source_url IN (${placeholders})`,
+    )
+      .bind(...batch)
+      .all();
+    for (const row of rows.results as Record<string, unknown>[]) {
+      const key = getStr(row, "source_url");
+      cache.set(key, {
+        id: getNum(row, "id"),
+        url: `https://${env.DOMAIN}/files/${getStr(row, "public_id")}/${encodeURIComponent(getStr(row, "name"))}`,
+      });
+    }
+    for (const key of batch) known.add(key);
+  }
+}
+
 async function ingestImage(
   env: Env,
   url: string,
   cache: Map<string, Ingested | null>,
+  known: Set<string>,
 ): Promise<Ingested | null> {
   const key = url.split("?")[0];
   if (cache.has(key)) return cache.get(key) ?? null;
   let result: Ingested | null = null;
   try {
-    const existing = await env.DB.prepare(
-      "SELECT id, public_id, name FROM feed_enclosures WHERE source_url = ? LIMIT 1",
-    )
-      .bind(key)
-      .first();
+    const existing = known.has(key)
+      ? null
+      : await env.DB.prepare(
+          "SELECT id, public_id, name FROM feed_enclosures WHERE source_url = ? LIMIT 1",
+        )
+          .bind(key)
+          .first();
     if (existing) {
       const e = existing as Record<string, unknown>;
       result = {
@@ -335,6 +392,15 @@ async function runDigest(
   });
 
   const imageCache = new Map<string, Ingested | null>();
+  const knownImages = new Set<string>();
+  if (config.ingestImages) {
+    await preloadImages(
+      env,
+      entries.map((e) => getStr(e, "image")).filter(Boolean),
+      imageCache,
+      knownImages,
+    );
+  }
   const linkedEnclosures = new Set<number>();
   let imageBudget = config.ingestImages ? IMAGE_INGEST_BUDGET : 0;
   let digestImage = "";
@@ -351,7 +417,7 @@ async function runDigest(
     let headerImage = sourceImage;
     if (sourceImage && config.ingestImages && imageBudget > 0) {
       imageBudget--;
-      const ingested = await ingestImage(env, sourceImage, imageCache);
+      const ingested = await ingestImage(env, sourceImage, imageCache, knownImages);
       if (ingested) {
         headerImage = ingested.url;
         linkedEnclosures.add(ingested.id);
@@ -422,26 +488,31 @@ async function runDigest(
   const entryId = Number(ins.meta.last_row_id);
 
   // Record the identities this entry consumed (dedup memory that lives and dies
-  // with the entry), then drop the transient inbox rows.
+  // with the entry), drop the transient inbox rows, and link ingested images.
+  // Batched into one round trip (and one transaction).
+  const followups: D1PreparedStatement[] = [];
   for (const e of entries) {
-    await db
-      .prepare("INSERT INTO entry_source_items (entry_id, guid, url) VALUES (?, ?, ?)")
-      .bind(entryId, getStr(e, "guid"), getStr(e, "url"))
-      .run();
+    followups.push(
+      db
+        .prepare("INSERT INTO entry_source_items (entry_id, guid, url) VALUES (?, ?, ?)")
+        .bind(entryId, getStr(e, "guid"), getStr(e, "url")),
+    );
   }
   const ids = entries.map((e) => getNum(e, "id"));
   const placeholders = ids.map(() => "?").join(",");
-  await db
-    .prepare(`DELETE FROM source_items WHERE producer_id = ? AND id IN (${placeholders})`)
-    .bind(producerId, ...ids)
-    .run();
-
+  followups.push(
+    db
+      .prepare(`DELETE FROM source_items WHERE producer_id = ? AND id IN (${placeholders})`)
+      .bind(producerId, ...ids),
+  );
   for (const enclosureId of linkedEnclosures) {
-    await db
-      .prepare("INSERT INTO feed_entry_enclosure_links (entry_id, enclosure_id) VALUES (?, ?)")
-      .bind(entryId, enclosureId)
-      .run();
+    followups.push(
+      db
+        .prepare("INSERT INTO feed_entry_enclosure_links (entry_id, enclosure_id) VALUES (?, ?)")
+        .bind(entryId, enclosureId),
+    );
   }
+  if (followups.length > 0) await db.batch(followups);
 
   return true;
 }
@@ -479,19 +550,16 @@ export async function deliverEmail(
   const htmlContent = parsed.html || (parsed.text ? textToHtml(parsed.text) : "No content.");
 
   const entryPublicId = generatePublicId();
-  await env.DB.prepare(
+  const ins = await env.DB.prepare(
     `INSERT INTO feed_entries (public_id, feed_id, author, title, content)
      VALUES (?, ?, ?, ?, ?)`,
   )
     .bind(entryPublicId, feedId, author, subject, htmlContent)
     .run();
+  const entryId = Number(ins.meta.last_row_id);
+  if (!entryId) return;
 
-  const entry = await env.DB.prepare("SELECT id FROM feed_entries WHERE public_id = ?")
-    .bind(entryPublicId)
-    .first();
-  if (!entry) return;
-  const entryId = getNum(entry as Record<string, unknown>, "id");
-
+  const statements: D1PreparedStatement[] = [];
   const attachments = parsed.attachments || [];
   for (const att of attachments) {
     const enclosurePublicId = generatePublicId();
@@ -500,11 +568,11 @@ export async function deliverEmail(
     await env.ATTACHMENTS.put(r2Key, att.content, {
       httpMetadata: { contentType: att.mimeType || "application/octet-stream" },
     });
-    await env.DB.prepare(
-      `INSERT INTO feed_enclosures (public_id, type, length, name, r2_key)
-       VALUES (?, ?, ?, ?, ?)`,
-    )
-      .bind(
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO feed_enclosures (public_id, type, length, name, r2_key)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).bind(
         enclosurePublicId,
         att.mimeType || "application/octet-stream",
         typeof att.content === "string"
@@ -512,26 +580,25 @@ export async function deliverEmail(
           : att.content.byteLength,
         filename,
         r2Key,
-      )
-      .run();
-    const enclosure = await env.DB.prepare(
-      "SELECT id FROM feed_enclosures WHERE public_id = ?",
-    )
-      .bind(enclosurePublicId)
-      .first();
-    if (enclosure) {
-      await env.DB.prepare(
-        "INSERT INTO feed_entry_enclosure_links (entry_id, enclosure_id) VALUES (?, ?)",
-      )
-        .bind(entryId, getNum(enclosure as Record<string, unknown>, "id"))
-        .run();
-    }
+      ),
+    );
+    // Resolve the new enclosure by its public id inside the same batch, so no
+    // separate SELECT is needed to learn its row id.
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO feed_entry_enclosure_links (entry_id, enclosure_id)
+         SELECT ?, id FROM feed_enclosures WHERE public_id = ?`,
+      ).bind(entryId, enclosurePublicId),
+    );
   }
 
   const senderDomain = author.split("@")[1];
   if (senderDomain) {
-    await env.DB.prepare("UPDATE feeds SET email_icon = ? WHERE id = ?")
-      .bind(`https://${senderDomain}/favicon.ico`, feedId)
-      .run();
+    statements.push(
+      env.DB.prepare("UPDATE feeds SET email_icon = ? WHERE id = ?")
+        .bind(`https://${senderDomain}/favicon.ico`, feedId),
+    );
   }
+
+  if (statements.length > 0) await env.DB.batch(statements);
 }
